@@ -1,0 +1,646 @@
+repeat task.wait() until game:IsLoaded()
+
+--[[
+    BlockSpin — Account Log (Horst)
+
+    อ่าน stat จาก module จริงของเกม:
+      - Level: XPFormula.xp_to_level(Data.xp.total_level)
+      - ATM:   Data.money.bank
+      - Jobs:  XPFormula.xp_to_level(Data.xp[skillId])  (skill id จาก SkillsList)
+      - Cars:  Data.items.car + Dirtbike จาก Data.items.bike
+    Modules: ReplicatedStorage.Modules.Core.Data
+             ReplicatedStorage.Modules.Game.Skills.XPFormula
+
+    ส่ง Level, เงินใน ATM, รถ/ไบค์ (Cars + Dirtbike) และเลเวลอาชีพ (Janitor / Cook / Stocker / Swiper / Fishing / Farming) ไปยัง Horst
+    ต้องโหลด Horst Connect.lua ก่อนไฟล์นี้ (ไม่โหลด on_loaded.lua ในสคริปต์นี้แล้ว)
+    คอนฟิกข้างนอก: ตั้ง getgenv().HorstConfig ก่อนรันไฟล์นี้ ค่าที่ใส่จะทับค่าเริ่มต้น (ใส่เฉพาะที่อยากเปลี่ยนก็ได้)
+    API: _G.Horst_SetDescription(description, encodeJson?)
+         _G.Horst_AccountChangeDone()
+    Docs: https://github.com/HorstSpaceX/Documentation/blob/main/README.md
+]]
+
+local DEFAULT_HORST_CONFIG = {
+    ["EnableLog"] = false,
+    ["UpdateInterval"] = 15,
+    ["DataWait"] = 8, -- รอ save ผู้เล่นโหลด (วินาที)
+
+    -- เปิด/ปิดรายการที่โชว์ใน Log
+    ["ShowLog"] = {
+        ["Level"] = false,
+        ["ATM"] = false, -- เงินฝากใน ATM (ไม่ใช่เงินสดในกระเป๋า)
+        ["Janitor"] = false,
+        ["Cook"] = false,
+        ["Stocker"] = false,
+        ["Swiper"] = false,
+        ["Fishing"] = false,
+        ["Farming"] = false,
+        ["Cars"] = false, -- รถ (Data.items.car) + Dirtbike (Data.items.bike)
+    },
+
+    -- ส่ง Done เมื่อเงื่อนไขครบ
+    ["Done"] = {
+        ["Enable"] = false,
+        ["RequireAll"] = false, -- true = ต้องผ่านทุกข้อที่ Enable, false = ผ่านข้อใดข้อหนึ่ง
+
+        ["Level"] = {
+            ["Enable"] = false,
+            ["Amount"] = 50,
+        },
+        ["ATM"] = {
+            ["Enable"] = false,
+            ["Amount"] = 1000500, -- 1M ใน ATM
+        },
+        ["Janitor"] = {
+            ["Enable"] = false,
+            ["Amount"] = 50,
+        },
+        ["Cook"] = {
+            ["Enable"] = false,
+            ["Amount"] = 50,
+        },
+        ["Stocker"] = {
+            ["Enable"] = false,
+            ["Amount"] = 50,
+        },
+        ["Swiper"] = {
+            ["Enable"] = false,
+            ["Amount"] = 50,
+        },
+        ["Fishing"] = {
+            ["Enable"] = false,
+            ["Amount"] = 50,
+        },
+        ["Farming"] = {
+            ["Enable"] = false,
+            ["Amount"] = 50,
+        },
+        ["Cars"] = {
+            ["Enable"] = false,
+            ["Amount"] = 1, -- จำนวนรถ + Dirtbike ที่ต้องมี
+        },
+    },
+}
+
+local function mergeHorstConfig(base, override)
+    if type(override) ~= "table" then
+        return base
+    end
+
+    local merged = {}
+    for key, value in pairs(base) do
+        merged[key] = value
+    end
+    for key, value in pairs(override) do
+        if type(value) == "table" and type(merged[key]) == "table" then
+            merged[key] = mergeHorstConfig(merged[key], value)
+        else
+            merged[key] = value
+        end
+    end
+    return merged
+end
+
+-- ถ้าตั้ง getgenv().HorstConfig ไว้ข้างนอกก่อนรัน ค่าเหล่านั้นจะทับค่าเริ่มต้น
+getgenv().HorstConfig = mergeHorstConfig(DEFAULT_HORST_CONFIG, getgenv().HorstConfig)
+
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local SEP = " ┇ "
+local TAG = "[BlockSpin Log]"
+
+local JOB_DEFS = {
+    { key = "Janitor", label = "Janitor", emoji = "🧹", aliases = { "janitor", "Janitor", "janitor_level", "JanitorLevel" } },
+    { key = "Cook", label = "Cook", emoji = "🍳", aliases = { "cook", "Cook", "cook_level", "CookLevel", "butcher", "Butcher" } },
+    { key = "Stocker", label = "Stocker", emoji = "📦", aliases = { "stocker", "Stocker", "shelf_stocker", "ShelfStocker", "shelfstocker", "Shelf Stocker", "shelf" } },
+    { key = "Swiper", label = "Swiper", emoji = "💳", aliases = { "swiper", "Swiper", "swiper_level", "SwiperLevel", "hacker", "Hacker" } },
+    { key = "Fishing", label = "Fishing", emoji = "🎣", aliases = { "fishing", "Fishing", "fishing_level", "FishingLevel", "fisher", "Fisher", "angler", "Angler" } },
+    { key = "Farming", label = "Farming", emoji = "🌾", aliases = { "farming", "Farming", "farming_level", "FarmingLevel", "farmer", "Farmer", "farm", "Farm" } },
+}
+
+-- skill id จาก ReplicatedStorage.Modules.Game.Skills.SkillsList
+local SKILL_IDS = {
+    Janitor = "janitor",
+    Cook = "cook",
+    Stocker = "shelf_stocker",
+    Swiper = "atm_hacker",
+    Farming = "farmer",
+    Fishing = "fishing",
+}
+
+local loopId = tick()
+getgenv()._horstLoopId = loopId
+
+task.spawn(function()
+    local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+    local function log(msg)
+        print(TAG .. " " .. tostring(msg))
+    end
+
+    local function getConfig()
+        return getgenv().HorstConfig or {}
+    end
+
+    local function getDoneConfig()
+        local done = getConfig().Done
+        if type(done) ~= "table" then
+            return {}
+        end
+        return done
+    end
+
+    local function isShowEnabled(key)
+        local show = getConfig().ShowLog
+        if type(show) ~= "table" then
+            return true
+        end
+        if show[key] == nil then
+            return true
+        end
+        return show[key] == true
+    end
+
+    local DataModule = nil
+    local XPFormulaModule = nil
+
+    local function formatMoney(value)
+        local n = math.floor(tonumber(value) or 0)
+        if n < 1000 then
+            return tostring(n)
+        end
+
+        local units = {
+            { 1e12, "T" },
+            { 1e9, "B" },
+            { 1e6, "M" },
+            { 1e3, "K" },
+        }
+
+        for _, unit in ipairs(units) do
+            local scale, suffix = unit[1], unit[2]
+            if n >= scale then
+                local scaled = n / scale
+                if scaled >= 100 then
+                    return string.format("%d%s", math.floor(scaled + 0.5), suffix)
+                end
+                local text = string.format("%.1f%s", scaled, suffix)
+                return text:gsub("%.0", "")
+            end
+        end
+
+        return tostring(n)
+    end
+
+    local function collectVehicleItems(itemRoot)
+        local vehicles = {}
+        if typeof(itemRoot) ~= "table" then
+            return vehicles
+        end
+
+        for modelId, instances in pairs(itemRoot) do
+            if typeof(instances) == "table" then
+                for _, instData in pairs(instances) do
+                    if typeof(instData) == "table" then
+                        table.insert(vehicles, {
+                            name = tostring(instData.name or modelId),
+                            modelId = tostring(modelId),
+                            location = instData.location and tostring(instData.location) or nil,
+                            amount = math.max(1, math.floor(tonumber(instData.amount) or 1)),
+                        })
+                    end
+                end
+            end
+        end
+
+        return vehicles
+    end
+
+    local function normalizeVehicleKey(value)
+        return tostring(value or ""):lower():gsub("[%s_%-]", "")
+    end
+
+    local function isDirtbikeEntry(name, modelId)
+        local normalizedName = normalizeVehicleKey(name)
+        local normalizedModel = normalizeVehicleKey(modelId)
+        return normalizedName:find("dirtbike", 1, true) ~= nil
+            or normalizedModel:find("dirtbike", 1, true) ~= nil
+    end
+
+    local function collectCarsCategory(itemsData)
+        local vehicles = {}
+
+        if typeof(itemsData) ~= "table" then
+            return vehicles
+        end
+
+        if typeof(itemsData.car) == "table" then
+            for _, vehicle in ipairs(collectVehicleItems(itemsData.car)) do
+                table.insert(vehicles, vehicle)
+            end
+        end
+
+        if typeof(itemsData.bike) == "table" then
+            for modelId, instances in pairs(itemsData.bike) do
+                if typeof(instances) == "table" then
+                    for _, instData in pairs(instances) do
+                        if typeof(instData) == "table" then
+                            local name = tostring(instData.name or modelId)
+                            if isDirtbikeEntry(name, modelId) then
+                                table.insert(vehicles, {
+                                    name = name,
+                                    modelId = tostring(modelId),
+                                    location = instData.location and tostring(instData.location) or nil,
+                                    amount = math.max(1, math.floor(tonumber(instData.amount) or 1)),
+                                })
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        return vehicles
+    end
+
+    local function formatCarSummary(cars)
+        local nameCounts = {}
+        local total = 0
+
+        for _, car in ipairs(cars) do
+            local name = car.name or car.modelId or "?"
+            local amount = car.amount or 1
+            nameCounts[name] = (nameCounts[name] or 0) + amount
+            total += amount
+        end
+
+        local names = {}
+        for name in pairs(nameCounts) do
+            table.insert(names, name)
+        end
+        table.sort(names)
+
+        local parts = {}
+        for _, name in ipairs(names) do
+            local count = nameCounts[name]
+            if count > 1 then
+                table.insert(parts, name .. " x" .. tostring(count))
+            else
+                table.insert(parts, name)
+            end
+        end
+
+        return total, parts
+    end
+
+    local function emptyStats()
+        local stats = {
+            level = 0,
+            atm = 0,
+            carCount = 0,
+            cars = {},
+            jobs = {},
+            sources = {},
+        }
+        for _, def in ipairs(JOB_DEFS) do
+            stats.jobs[def.key] = 0
+        end
+        return stats
+    end
+
+    local function noteSource(stats, name)
+        if type(stats.sources) == "table" then
+            stats.sources[name] = true
+        end
+    end
+
+    local function loadBlockSpinModules()
+        if DataModule and XPFormulaModule then
+            return true
+        end
+
+        local modules = ReplicatedStorage:FindFirstChild("Modules")
+        if not modules then
+            return false
+        end
+
+        local core = modules:FindFirstChild("Core")
+        local gameFolder = modules:FindFirstChild("Game")
+        if not core or not gameFolder then
+            return false
+        end
+
+        local dataScript = core:FindFirstChild("Data")
+        local skillsFolder = gameFolder:FindFirstChild("Skills")
+        if not dataScript or not skillsFolder then
+            return false
+        end
+
+        local xpScript = skillsFolder:FindFirstChild("XPFormula")
+        if not xpScript then
+            return false
+        end
+
+        local okData, data = pcall(require, dataScript)
+        local okXp, xpFormula = pcall(require, xpScript)
+        if not okData or not okXp or typeof(data) ~= "table" or typeof(xpFormula) ~= "table" then
+            return false
+        end
+
+        DataModule = data
+        XPFormulaModule = xpFormula
+        return true
+    end
+
+    local DATA_WAIT = tonumber(getConfig().DataWait) or 8
+
+    local function isDataConnected()
+        if not DataModule then
+            return false
+        end
+
+        local connected = DataModule.connected
+        if typeof(connected) == "table" and typeof(connected.get) == "function" then
+            return connected.get() == true
+        end
+
+        local attr = LocalPlayer:GetAttribute("data_loaded")
+        return attr == true or attr == "true"
+    end
+
+    local function collectStats()
+        local stats = emptyStats()
+
+        if not loadBlockSpinModules() or not isDataConnected() then
+            local attrLevel = tonumber(LocalPlayer:GetAttribute("level"))
+            if attrLevel and attrLevel > 0 then
+                stats.level = math.floor(attrLevel)
+                noteSource(stats, "player_attributes.level")
+            end
+            return stats
+        end
+
+        local xpData = DataModule.xp
+        local moneyData = DataModule.money
+        local xpToLevel = XPFormulaModule.xp_to_level
+
+        if typeof(xpData) == "table" and typeof(xpToLevel) == "function" then
+            stats.level = math.floor(xpToLevel(xpData.total_level or 0))
+            noteSource(stats, "Data.xp.total_level")
+
+            for jobKey, skillId in pairs(SKILL_IDS) do
+                if stats.jobs[jobKey] ~= nil then
+                    stats.jobs[jobKey] = math.floor(xpToLevel(xpData[skillId] or 0))
+                end
+            end
+            noteSource(stats, "Data.xp")
+        end
+
+        if typeof(moneyData) == "table" then
+            stats.atm = math.floor(tonumber(moneyData.bank) or 0)
+            noteSource(stats, "Data.money.bank")
+        end
+
+        local itemsData = DataModule.items
+        if typeof(itemsData) == "table" then
+            stats.cars = collectCarsCategory(itemsData)
+            stats.carCount = select(1, formatCarSummary(stats.cars))
+
+            if typeof(itemsData.car) == "table" then
+                noteSource(stats, "Data.items.car")
+            end
+            if typeof(itemsData.bike) == "table" then
+                noteSource(stats, "Data.items.bike")
+            end
+        end
+
+        if stats.level <= 0 then
+            local attrLevel = tonumber(LocalPlayer:GetAttribute("level"))
+            if attrLevel and attrLevel > 0 then
+                stats.level = math.floor(attrLevel)
+                noteSource(stats, "player_attributes.level")
+            end
+        end
+
+        return stats
+    end
+
+    local function waitForPlayerData()
+        local deadline = tick() + DATA_WAIT
+        while tick() < deadline do
+            local stats = collectStats()
+            if stats.sources["Data.xp"] or stats.sources["Data.money.bank"] or stats.sources["Data.items.car"] or stats.sources["Data.items.bike"] then
+                return stats
+            end
+            task.wait(0.25)
+        end
+        return collectStats()
+    end
+
+    local function getAmountCondition(done, key)
+        local entry = done[key]
+        if type(entry) ~= "table" or entry.Enable ~= true then
+            return nil
+        end
+        return tonumber(entry.Amount) or 0
+    end
+
+    local function buildPayload(stats)
+        local jsonData = {}
+        local parts = {}
+
+        if isShowEnabled("Level") and stats.level >= 1 then
+            jsonData.Level = stats.level
+            table.insert(parts, "⭐ LV " .. tostring(stats.level))
+        end
+
+        if isShowEnabled("ATM") then
+            jsonData.ATM = stats.atm
+            jsonData.Money = stats.atm
+            table.insert(parts, "🏧 ATM $" .. formatMoney(stats.atm))
+        end
+
+        if isShowEnabled("Cars") then
+            local carTotal, carNames = formatCarSummary(stats.cars or {})
+            jsonData.Cars = carTotal
+            jsonData.CarList = carNames
+            if carTotal > 0 then
+                table.insert(parts, "🚗 " .. table.concat(carNames, ", "))
+            else
+                table.insert(parts, "🚗 Cars 0")
+            end
+        end
+
+        for _, def in ipairs(JOB_DEFS) do
+            local value = stats.jobs[def.key] or 0
+            if isShowEnabled(def.key) and value >= 1 then
+                jsonData[def.key] = value
+                table.insert(parts, def.emoji .. " " .. def.label .. " " .. tostring(value))
+            end
+        end
+
+        if #parts == 0 then
+            return nil, nil, stats
+        end
+
+        return table.concat(parts, SEP), jsonData, stats
+    end
+
+    local function evaluateDoneConditions(stats)
+        local done = getDoneConfig()
+        local checks = {}
+
+        local amountKeys = {
+            { key = "Level", current = stats.level },
+            { key = "ATM", current = stats.atm },
+            { key = "Cars", current = stats.carCount or 0 },
+        }
+
+        for _, item in ipairs(amountKeys) do
+            local required = getAmountCondition(done, item.key)
+            if required ~= nil then
+                table.insert(checks, {
+                    name = item.key,
+                    ok = item.current >= required,
+                    detail = tostring(item.current) .. "/" .. tostring(required),
+                })
+            end
+        end
+
+        for _, def in ipairs(JOB_DEFS) do
+            local required = getAmountCondition(done, def.key)
+            if required ~= nil then
+                local current = stats.jobs[def.key] or 0
+                table.insert(checks, {
+                    name = def.key,
+                    ok = current >= required,
+                    detail = tostring(current) .. "/" .. tostring(required),
+                })
+            end
+        end
+
+        if #checks == 0 then
+            return false, "ยังไม่ได้ตั้งเงื่อนไข Done"
+        end
+
+        local requireAll = done.RequireAll ~= false
+        local passed = {}
+        local failed = {}
+
+        for _, check in ipairs(checks) do
+            if check.ok then
+                table.insert(passed, check.name .. " (" .. check.detail .. ")")
+            else
+                table.insert(failed, check.name .. " (" .. check.detail .. ")")
+            end
+        end
+
+        local ok
+        if requireAll then
+            ok = #failed == 0
+        else
+            ok = #passed > 0
+        end
+
+        local detail
+        if ok then
+            detail = "ผ่าน: " .. table.concat(passed, ", ")
+        else
+            detail = "ยังไม่ครบ: " .. table.concat(failed, ", ")
+        end
+
+        return ok, detail
+    end
+
+    local function trySendDone(stats)
+        local done = getDoneConfig()
+        if done.Enable ~= true then
+            return
+        end
+        if getgenv()._horstDoneSent == true then
+            return
+        end
+
+        local okCond, detail = evaluateDoneConditions(stats)
+        if not okCond then
+            return
+        end
+
+        if typeof(_G.Horst_AccountChangeDone) ~= "function" then
+            log("⚠️ เงื่อนไข Done ครบแล้ว แต่ยังไม่พบ _G.Horst_AccountChangeDone (" .. tostring(detail) .. ")")
+            return
+        end
+
+        local ok, err = _G.Horst_AccountChangeDone()
+        if ok then
+            getgenv()._horstDoneSent = true
+            log("✅ ส่ง Done ไปยัง Horst สำเร็จ (" .. tostring(detail) .. ")")
+        else
+            log("❌ ส่ง Done ไม่สำเร็จ: " .. tostring(err))
+        end
+    end
+
+    local function sendToHorst(description, jsonData)
+        if typeof(_G.Horst_SetDescription) ~= "function" then
+            return false
+        end
+
+        local encoded = HttpService:JSONEncode(jsonData or {})
+        local ok, err = pcall(function()
+            _G.Horst_SetDescription(description, encoded)
+        end)
+
+        if not ok then
+            log("❌ Horst_SetDescription error: " .. tostring(err))
+            return false
+        end
+
+        return true
+    end
+
+    -- รอ Horst พร้อม
+    local waitCount = 0
+    while not _G.Horst_SetDescription and not _G.Horst_AccountChangeDone and waitCount < 10 do
+        task.wait(1)
+        waitCount += 1
+        log("⏳ รอ Horst... (" .. waitCount .. "/10)")
+    end
+
+    if not _G.Horst_SetDescription then
+        log("⚠️ ไม่พบ _G.Horst_SetDescription — จะ print log อย่างเดียว")
+    end
+
+    local interval = tonumber(getConfig().UpdateInterval) or 15
+    if interval < 5 then
+        interval = 5
+    end
+
+    log("⏳ รอข้อมูลผู้เล่นโหลด...")
+    waitForPlayerData()
+
+    while getgenv()._horstLoopId == loopId do
+        local enableLog = getConfig().EnableLog ~= false
+        local enableDone = getDoneConfig().Enable == true
+
+        if enableLog or enableDone then
+            local stats = collectStats()
+            local description, jsonData = buildPayload(stats)
+
+            if enableLog then
+                if description then
+                    log("📤 " .. description)
+                    sendToHorst(description, jsonData)
+                else
+                    log("ℹ️ ยังไม่พบ Data.xp / Data.money (รอ save โหลด หรือเช็คว่าอยู่ใน BlockSpin)")
+                end
+            end
+
+            if enableDone then
+                trySendDone(stats)
+            end
+        end
+
+        task.wait(interval)
+    end
+end)
